@@ -13,7 +13,7 @@ DOLTHUB_SQL_BASE = "https://www.dolthub.com/api/v1alpha1"
 
 # ───────────────────────── Helpers ─────────────────────────
 def run_sql(owner: str, database: str, token: str, query: str, ref: str | None = None) -> dict:
-    \"\"\"Execute a read-only SQL query against DoltHub SQL API and return JSON.\"\"\"
+    """Execute a read-only SQL query against DoltHub SQL API and return JSON."""
     base = f\"{DOLTHUB_SQL_BASE}/{owner}/{database}\" + (f\"/{ref}\" if ref else \"\")
     headers = {}
     if token:
