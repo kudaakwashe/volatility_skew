@@ -11,13 +11,16 @@ import yfinance as yf
 
 DOLTHUB_SQL_BASE = "https://www.dolthub.com/api/v1alpha1"
 
+# Hardcoded repo info
+OWNER = "post-no-preference"
+DATABASE = "options"
+
 # ───────────────────────── Helpers ─────────────────────────
-def run_sql(owner: str, database: str, token: str, query: str, ref: str | None = None) -> dict:
+def run_sql(query: str, token: str, ref: str | None = None) -> dict:
     """Execute a read-only SQL query against DoltHub SQL API and return JSON."""
-    base = f"{DOLTHUB_SQL_BASE}/{owner}/{database}" + (f"/{ref}" if ref else "")
+    base = f"{DOLTHUB_SQL_BASE}/{OWNER}/{DATABASE}" + (f"/{ref}" if ref else "")
     headers = {}
     if token:
-        # DoltHub expects: Authorization: token <TOKEN>
         headers["Authorization"] = f"token {token}"
     # Prefer POST JSON to /sql
     try:
@@ -28,7 +31,7 @@ def run_sql(owner: str, database: str, token: str, query: str, ref: str | None =
             return payload
     except Exception:
         pass
-    # Fallback to GET ?q=
+    # Fallback to GET
     r = requests.get(base, params={"q": query}, headers=headers, timeout=90)
     r.raise_for_status()
     payload = r.json()
@@ -42,10 +45,9 @@ def rows_to_df(payload: dict) -> pd.DataFrame:
         return pd.DataFrame()
     return pd.DataFrame(rows)
 
-def fetch_option_chain(owner: str, database: str, token: str, ref: str | None,
+def fetch_option_chain(token: str, ref: str | None,
                        symbol: str, start_dt: datetime, end_dt: datetime,
                        table: str = "option_chain", limit: int = 500000) -> pd.DataFrame:
-    # Use ISO dates (YYYY-MM-DD) to be friendly with DATE columns
     start_str = start_dt.strftime("%Y-%m-%d")
     end_str   = end_dt.strftime("%Y-%m-%d")
     q = f"""
@@ -57,12 +59,11 @@ def fetch_option_chain(owner: str, database: str, token: str, ref: str | None,
       ORDER BY `date`, `expiration`, `strike`
       LIMIT {limit}
     """
-    payload = run_sql(owner, database, token, q, ref)
+    payload = run_sql(q, token, ref)
     df = rows_to_df(payload)
     if df.empty:
         return df
 
-    # Parse date / expiration. Try generic first, then specific formats.
     for col in ["date", "expiration"]:
         parsed = pd.to_datetime(df[col], errors="coerce", utc=True)
         if parsed.isna().all():
@@ -83,28 +84,12 @@ def fill_spot_from_yahoo(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return out
 
 def compute_skew_for_day(day_df: pd.DataFrame, snap_dt: pd.Timestamp, target_dte: int):
-    # Ensure tz-naive throughout to avoid tz-naive/aware subtraction issues
-    def _to_naive_ts(x):
-        if isinstance(x, pd.Timestamp):
-            return x.tz_convert(None) if x.tzinfo is not None else x
-        return pd.Timestamp(x).tz_localize(None) if getattr(x, 'tzinfo', None) is not None else pd.Timestamp(x)
-
-    day_df = day_df.copy()
-    # Strip tz from 'expiration' and 'date'
-    if hasattr(day_df['expiration'].dtype, 'tz') and day_df['expiration'].dt.tz is not None:
-        day_df['expiration'] = day_df['expiration'].dt.tz_convert(None)
-    if hasattr(day_df['date'].dtype, 'tz') and day_df['date'].dt.tz is not None:
-        day_df['date'] = day_df['date'].dt.tz_convert(None)
-
-    snap_dt_naive = _to_naive_ts(snap_dt).normalize()
-    day_df["expiration"] = pd.to_datetime(day_df["expiration"]).dt.normalize()
-    day_df["date"] = pd.to_datetime(day_df["date"]).dt.normalize()
-
+    snap_dt = snap_dt.tz_localize(None).normalize()
     day = day_df.copy()
-    # DTE in days (expiration - snapshot)
-    day["dte"] = (day["expiration"] - snap_dt_naive).dt.days
-    day = day_df.copy()
-    day["dte"] = (day["expiration"].dt.date - snap_dt.date()).astype("timedelta64[D]").astype(int)
+    day["expiration"] = day["expiration"].dt.tz_localize(None).dt.normalize()
+    day["date"] = day["date"].dt.tz_localize(None).dt.normalize()
+    day["dte"] = (day["expiration"] - snap_dt).dt.days
+
     cand = day.loc[day["dte"] >= 1, ["expiration","dte"]].drop_duplicates()
     if cand.empty:
         return None
@@ -199,9 +184,7 @@ st.caption("Call skew = (ATM IV − 25Δ Call IV) / ATM IV • Put skew = (ATM I
 
 with st.sidebar:
     st.subheader("DoltHub SQL")
-    owner = st.text_input("Owner (org/user)", value="your-org")
-    database = st.text_input("Database (repo name)", value="your-db")
-    ref = st.text_input("Ref (branch or commit hash, optional)", value="")  # e.g. main or commit id
+    ref = st.text_input("Ref (branch or commit hash, optional)", value="")
     token = st.text_input("API Token", type="password", value=st.secrets.get("dolthub", {}).get("token", ""))
 
     st.subheader("Query params")
@@ -217,7 +200,7 @@ end_dt   = asof
 # ───────────────────────── Run ─────────────────────────
 with st.spinner("Querying DoltHub and computing skews…"):
     try:
-        raw = fetch_option_chain(owner, database, token, ref.strip() or None, ticker, start_dt, end_dt, table)
+        raw = fetch_option_chain(token, ref.strip() or None, ticker, start_dt, end_dt, table)
     except Exception as e:
         raw = pd.DataFrame()
         st.error(f"Fetch failed: {e}")
@@ -228,7 +211,7 @@ left, right = st.columns([1,1])
 with left:
     st.subheader(f"{ticker} • {months}m • DTE≈{target_dte}d")
     if ts.empty:
-        st.info("No timeseries built. Check owner/database/ref, token, and table/columns.")
+        st.info("No timeseries built. Check ref, token, and table/columns.")
     else:
         st.plotly_chart(plot_skew_timeseries(ts, "Call"), use_container_width=True)
 with right:
