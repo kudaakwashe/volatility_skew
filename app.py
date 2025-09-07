@@ -23,18 +23,19 @@ DATABASE = "options"
 
 def run_sql(query: str, token: str, ref: str | None = None) -> dict:
     """Execute a read-only SQL query against DoltHub SQL API and return JSON."""
-    # If a token is supplied, DoltHub requires a ref (branch/commit). Default to 'main'.
-    use_ref = (ref.strip() if ref else "") or ("main" if token else "")
+    # If a token is supplied, DoltHub requires a ref (branch/commit). Default to 'master'.
+    use_ref = (ref.strip() if ref else "") or ("master" if token else "")
     base = f"https://www.dolthub.com/api/v1alpha1/{OWNER}/{DATABASE}" + (f"/{use_ref}" if use_ref else "")
     headers = {}
     if token:
-        headers["authorization"] = f"token {token}"  # ← IMPORTANT
+        headers["authorization"] = f"token {token}"
     res = requests.get(base, params={"q": query}, headers=headers, timeout=90)
     res.raise_for_status()
     payload = res.json()
     if payload.get("query_execution_status") not in ("Success", "RowLimit"):
         raise RuntimeError(payload.get("query_execution_message", "Unknown DoltHub SQL error"))
     return payload
+
 
 
 def rows_to_df(payload: dict) -> pd.DataFrame:
