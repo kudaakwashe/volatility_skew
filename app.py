@@ -1,93 +1,107 @@
-
-# app.py — Skew Timeseries from DoltHub SQL (table: option_chain)
+# app.py — Skew Timeseries from local Dolt SQL server (table: option_chain)
 # DISCLAIMER: For educational/research use only. Not investment advice.
 
 from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import requests
 import streamlit as st
+from sqlalchemy import create_engine, text
 import yfinance as yf
 
-DOLTHUB_SQL_BASE = "https://www.dolthub.com/api/v1alpha1"
+# ───────────────────────── Streamlit UI ─────────────────────────
+st.set_page_config(page_title="Skew Timeseries — Local Dolt", layout="wide")
+st.title("Skew Timeseries (25Δ Call/Put vs ATM) — Local Dolt")
+st.caption("Call skew = (ATM IV − 25Δ Call IV) / ATM IV • Put skew = (ATM IV − 25Δ Put IV) / ATM IV • Nearest 25Δ via stored `delta`.")
 
-# Hardcoded repo info (from your link)
-OWNER = "post-no-preference"
-DATABASE = "options"
+with st.sidebar:
+    st.subheader("Local Dolt connection")
+    st.write("Configure `.streamlit/secrets.toml` (example below).")
+    dolt_db = st.text_input("Database", value=st.secrets.get("dolt", {}).get("database", "options"))
+    dolt_branch = st.text_input("Branch (optional)", value="")   # e.g., master
+    dolt_commit = st.text_input("Commit hash (optional)", value="")  # read-only at commit
 
-# ───────────────────────── Helpers ─────────────────────────
-# Hardcoded repo:
-OWNER = "post-no-preference"
-DATABASE = "options"
+    st.subheader("Query params")
+    ticker = st.text_input("Ticker (act_symbol)", value="A").strip().upper()
+    target_dte = st.number_input("Target DTE (days)", 7, 90, 30, 1)
+    months = st.slider("Lookback (months)", 1, 24, 6)
+    table = st.text_input("Table", value="option_chain")
+    dates_are_text = st.checkbox("`date` is TEXT like YYYY/MM/DD", value=False)
 
-def run_sql(query: str, token: str, ref: str | None = None) -> dict:
-    """Execute a read-only SQL query against DoltHub SQL API and return JSON."""
-    # If a token is supplied, DoltHub requires a ref (branch/commit). Default to 'master'.
-    use_ref = (ref.strip() if ref else "") or ("master" if token else "")
-    base = f"https://www.dolthub.com/api/v1alpha1/{OWNER}/{DATABASE}" + (f"/{use_ref}" if use_ref else "")
-    headers = {}
-    if token:
-        headers["authorization"] = f"token {token}"
-    res = requests.get(base, params={"q": query}, headers=headers, timeout=90)
-    res.raise_for_status()
-    payload = res.json()
-    if payload.get("query_execution_status") not in ("Success", "RowLimit"):
-        raise RuntimeError(payload.get("query_execution_message", "Unknown DoltHub SQL error"))
-    return payload
+asof = datetime.now(timezone.utc)
+start_dt = asof - timedelta(days=30*months)
+end_dt   = asof
 
+# ───────────────────────── DB connection ─────────────────────────
+@st.cache_resource(show_spinner=False)
+def get_engine_from_secrets(db_name: str):
+    """Expect secrets:
+    [dolt]
+    host="127.0.0.1"
+    port=3306
+    database="options"
+    user="root"
+    password=""
+    """
+    s = st.secrets.get("dolt", {})
+    host = s.get("host", "127.0.0.1")
+    port = int(s.get("port", 3306))
+    user = s.get("user", "root")
+    password = s.get("password", "")
+    uri = f"mysql+pymysql://{user}:{password}@{host}:{port}/{db_name}"
+    return create_engine(uri, pool_pre_ping=True, pool_recycle=3600)
 
+engine = get_engine_from_secrets(dolt_db)
 
-def rows_to_df(payload: dict) -> pd.DataFrame:
-    rows = payload.get("rows", [])
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows)
+def select_branch_or_commit(conn, branch: str, commit: str):
+    """Use Dolt session procs/vars to move the read view."""
+    try:
+        if branch.strip():
+            conn.execute(text("CALL DOLT_CHECKOUT(:b)"), {"b": branch.strip()})
+        if commit.strip():
+            conn.execute(text("SET @@dolt_read_from_commit = :h"), {"h": commit.strip()})
+    except Exception as e:
+        st.warning(f"Branch/commit selection failed; reading current HEAD. Detail: {e}")
 
-def fetch_option_chain(token: str, ref: str | None,
-                       symbol: str, start_dt: datetime, end_dt: datetime,
-                       table: str = "option_chain", limit: int = 500000,
-                       dates_are_text: bool = False) -> pd.DataFrame:
+# ───────────────────────── Data fetch ─────────────────────────
+@st.cache_data(ttl=600, show_spinner=True)
+def fetch_option_chain(symbol: str, start_dt: datetime, end_dt: datetime,
+                       table: str, branch: str, commit: str, dates_are_text: bool) -> pd.DataFrame:
     start_iso = start_dt.strftime("%Y-%m-%d")
     end_iso   = end_dt.strftime("%Y-%m-%d")
 
     if dates_are_text:
-        # If `date` stored as 'YYYY/MM/DD' TEXT, normalize with STR_TO_DATE in SQL
-        date_filter = f"""
-          STR_TO_DATE(`date`, '%Y/%m/%d') >= '{start_iso}' AND STR_TO_DATE(`date`, '%Y/%m/%d') <= '{end_iso}'
-        """.strip()
+        date_filter = "STR_TO_DATE(`date`, '%Y/%m/%d') >= :s AND STR_TO_DATE(`date`, '%Y/%m/%d') <= :e"
     else:
-        date_filter = f"""
-          `date` >= '{start_iso}' AND `date` <= '{end_iso}'
-        """.strip()
+        date_filter = "`date` >= :s AND `date` <= :e"
 
-    q = f"""
-      SELECT `date`, `act_symbol`, `expiration`, `strike`, `call_put`,
-             `bid`, `ask`, `vol`, `delta`, `gamma`, `theta`, `vega`, `rho`
-      FROM {table}
-      WHERE act_symbol = '{symbol}'
-        AND {date_filter}
-      ORDER BY `date`, `expiration`, `strike`
-      LIMIT {limit}
-    """
-    payload = run_sql(q, token, ref)
-    df = rows_to_df(payload)
-    if df.empty:
-        return df
+    q = text(f"""
+        SELECT `date`,`act_symbol`,`expiration`,`strike`,`call_put`,`vol`,`delta`
+        FROM {table}
+        WHERE act_symbol = :tic
+          AND {date_filter}
+    """)
 
-    # Parse dates (both DATE and 'YYYY/MM/DD' text supported)
+    with engine.begin() as conn:
+        select_branch_or_commit(conn, branch, commit)
+        df = pd.read_sql(q, conn, params={"tic": symbol, "s": start_iso, "e": end_iso})
+
     for col in ["date", "expiration"]:
         parsed = pd.to_datetime(df[col], errors="coerce", utc=True)
-        # fallback to slash format if needed
         if parsed.isna().all():
             parsed = pd.to_datetime(df[col], errors="coerce", utc=True, format="%Y/%m/%d")
         df[col] = parsed
-    df["call_put"] = df["call_put"].astype(str).str.capitalize().str[:3]
-    num_cols = ["strike","bid","ask","vol","delta","gamma","theta","vega","rho"]
-    for c in num_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.dropna(subset=["date","expiration","strike"])
 
+    df["call_put"] = df["call_put"].astype(str).str.capitalize().str[:3]
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+    for c in ["vol","delta"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=["date","expiration","strike"]).drop_duplicates()
+    df = df.sort_values(["date","expiration","strike"]).reset_index(drop=True)
+    return df
+
+# ───────────────────────── Spot fill ─────────────────────────
 def fill_spot_from_yahoo(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     px = yf.Ticker(symbol).history(period="2y")["Close"].rename("spot").to_frame()
     px.index = pd.to_datetime(px.index.date)
@@ -96,8 +110,8 @@ def fill_spot_from_yahoo(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     out = out.merge(px, left_on="asof_date", right_index=True, how="left")
     return out
 
+# ───────────────────────── Skew calc ─────────────────────────
 def compute_skew_for_day(day_df: pd.DataFrame, snap_dt: pd.Timestamp, target_dte: int):
-    # normalize tz
     snap_dt = pd.Timestamp(snap_dt).tz_localize(None).normalize()
     day = day_df.copy()
     day["expiration"] = pd.to_datetime(day["expiration"]).dt.tz_localize(None).dt.normalize()
@@ -191,50 +205,16 @@ def plot_skew_timeseries(ts: pd.DataFrame, mode="Call"):
                       yaxis_title=f"{mode} Skew (fraction)", hovermode="x unified")
     return fig
 
-# ───────────────────────── UI ─────────────────────────
-st.set_page_config(page_title="Skew Timeseries — DoltHub SQL", layout="wide")
-st.title("Skew Timeseries (25Δ Call/Put vs ATM) from DoltHub SQL")
-st.caption("Call skew = (ATM IV − 25Δ Call IV) / ATM IV • Put skew = (ATM IV − 25Δ Put IV) / ATM IV • Nearest 25Δ via stored `delta`.")
-
-with st.sidebar:
-    st.subheader("DoltHub SQL (post-no-preference/options)")
-    ref = st.text_input("Ref (branch or commit hash, optional)", value="")
-    token = st.text_input("API Token", type="password", value=st.secrets.get("dolthub", {}).get("token", ""))
-
-    st.subheader("Query params")
-    ticker = st.text_input("Ticker (act_symbol)", value="A").strip().upper()
-    target_dte = st.number_input("Target DTE (days)", 7, 90, 30, 1)
-    months = st.slider("Lookback (months)", 1, 24, 6)
-    table = st.text_input("Table", value="option_chain")
-    dates_are_text = st.checkbox("`date` column is TEXT like YYYY/MM/DD", value=False)
-
-    st.markdown("---")
-    if st.button("Test connection (SHOW TABLES)"):
-        try:
-            payload = run_sql("SHOW TABLES;", token, ref.strip() or None)
-            st.success("Connection OK. Tables: " + ", ".join([row.get(next(iter(row)), "?") for row in payload.get("rows", [])]))
-        except Exception as e:
-            st.error(f"Test failed: {e}")
-
-asof = datetime.now(timezone.utc)
-start_dt = asof - timedelta(days=30*months)
-end_dt   = asof
-
 # ───────────────────────── Run ─────────────────────────
-with st.spinner("Querying DoltHub and computing skews…"):
-    try:
-        raw = fetch_option_chain(token, ref.strip() or None, ticker, start_dt, end_dt, table, dates_are_text=dates_are_text)
-    except Exception as e:
-        raw = pd.DataFrame()
-        st.error(f"Fetch failed: {e}")
-
-    ts = build_timeseries(raw, ticker, target_dte)
+with st.spinner("Querying local Dolt and computing skews…"):
+    rows = fetch_option_chain(ticker, start_dt, end_dt, table, dolt_branch, dolt_commit, dates_are_text)
+    ts = build_timeseries(rows, ticker, target_dte)
 
 left, right = st.columns([1,1])
 with left:
     st.subheader(f"{ticker} • {months}m • DTE≈{target_dte}d")
     if ts.empty:
-        st.info("No timeseries built. Check ref, token, table/columns, and the date-type toggle.")
+        st.info("No timeseries built. Check DB/branch/commit, table/columns, and date format toggle.")
     else:
         st.plotly_chart(plot_skew_timeseries(ts, "Call"), use_container_width=True)
 with right:
