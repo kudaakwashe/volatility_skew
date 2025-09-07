@@ -17,20 +17,25 @@ OWNER = "post-no-preference"
 DATABASE = "options"
 
 # ───────────────────────── Helpers ─────────────────────────
+# Hardcoded repo:
+OWNER = "post-no-preference"
+DATABASE = "options"
+
 def run_sql(query: str, token: str, ref: str | None = None) -> dict:
-    """Execute a read-only SQL query against DoltHub SQL API and return JSON (GET ?q=...)."""
-    base = f"{DOLTHUB_SQL_BASE}/{OWNER}/{DATABASE}" + (f"/{ref}" if ref else "")
+    """Execute a read-only SQL query against DoltHub SQL API and return JSON."""
+    # If a token is supplied, DoltHub requires a ref (branch/commit). Default to 'main'.
+    use_ref = (ref.strip() if ref else "") or ("main" if token else "")
+    base = f"https://www.dolthub.com/api/v1alpha1/{OWNER}/{DATABASE}" + (f"/{use_ref}" if use_ref else "")
     headers = {}
     if token:
-        # Per docs, provide the API token as the value of the `authorization` header.
-        headers["authorization"] = token
+        headers["authorization"] = f"token {token}"  # ← IMPORTANT
     res = requests.get(base, params={"q": query}, headers=headers, timeout=90)
     res.raise_for_status()
     payload = res.json()
-    # DoltHub returns query_execution_status and message
     if payload.get("query_execution_status") not in ("Success", "RowLimit"):
         raise RuntimeError(payload.get("query_execution_message", "Unknown DoltHub SQL error"))
     return payload
+
 
 def rows_to_df(payload: dict) -> pd.DataFrame:
     rows = payload.get("rows", [])
